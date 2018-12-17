@@ -8,7 +8,8 @@ const Transform    = require('stream').Transform;
 const Protocol     = require('limitd-protocol');
 const retry        = require('retry');
 
-const disyuntor    = require('disyuntor');
+const Disyuntor = require('disyuntor').Disyuntor;
+const DisyuntorError = require('disyuntor').DisyuntorError;
 
 const lps = require('length-prefixed-stream');
 const lpm = require('length-prefixed-message');
@@ -120,11 +121,28 @@ function LimitdClient (options, done) {
     },
   }, circuitBreakerDefaults, options.breaker);
 
-  this._protectedRequest = disyuntor((request, callback) => {
-    this._directRequest(request, callback);
-  }, circuitBreakerParams);
+  this.disyuntor = new Disyuntor(circuitBreakerParams);
 
-  this.resetCircuitBreaker = () => this._protectedRequest.reset();
+  this._protectedRequest = (...args) => {
+    const callback = args[args.length - 1];
+    this.disyuntor.protect((resolve, reject) => {
+      return new Promise((resolve, reject) => {
+        const newArgs = args.slice(0, -1)
+        this._directRequest(...newArgs, (err, ...args) => {
+          if (err) {return reject(err); }
+          resolve(...args);
+        })
+      })
+    })
+    .then((...args) => {
+      callback(null, ...args)
+    })
+    .catch((err) => {
+      callback(err)
+    })
+  }
+
+  this.resetCircuitBreaker = () => this.disyuntor.reset();
 
   this.currentId = 0;
 
@@ -345,7 +363,7 @@ LimitdClient.prototype._retriedRequest = function(request, callback) {
   operation.attempt(() => {
     this._protectedRequest(request, (err, result) => {
       if (err) {
-        if (err instanceof disyuntor.DisyuntorError && err.reason === 'open') {
+        if (err instanceof DisyuntorError && err.reason === 'open') {
           this.pending_operations.delete(operation);
           return callback(operation.errors()[0] || err);
         }
